@@ -6,21 +6,23 @@
 #include <cstring>
 #include <dirent.h>
 #include <omp.h>
+#include <vector>
 #include "progress_bar.hpp"
 
 using namespace std;
 
-void write_from_uChar(unsigned char, unsigned char &, int, FILE *);
+void write_from_uChar(unsigned char, unsigned char &, int &, FILE *);
+void write_from_uChar(unsigned char, unsigned char &, int &, vector<unsigned char> &);
 
 int this_is_not_a_folder(char *);
 long int size_of_the_file(char *);
 void count_in_folder(string, long int *, long int &, long int &);
 
-void write_file_count(int, unsigned char &, int, FILE *);
-void write_file_size(long int, unsigned char &, int, FILE *);
-void write_file_name(char *, string *, unsigned char &, int &, FILE *);
-void write_the_file_content(FILE *, long int, string *, unsigned char &, int &, FILE *);
-void write_the_folder(string, string *, unsigned char &, int &, FILE *);
+void write_file_count(int, unsigned char &, int &, FILE *);
+void write_file_size(long int, unsigned char &, int &, vector<unsigned char> &);
+void write_file_name(char *, string *, unsigned char &, int &, vector<unsigned char> &);
+void write_the_file_content(FILE *, long int, string *, unsigned char &, int &, vector<unsigned char> &);
+void write_the_folder(string, string *, unsigned char &, int &, vector<unsigned char> &);
 
 progress PROGRESS;
 
@@ -37,23 +39,14 @@ bool erselcompare0(ersel a, ersel b)
   return a.number < b.number;
 }
 
-// Function to assign codes to the Huffman tree using OpenMP tasks
+// Function to assign codes to the Huffman tree
 void assign_codes(ersel *node, const string &code)
 {
   if (!node)
     return;
   node->bit = code;
-  if (!node->left && !node->right)
-  {
-    // Leaf node, no further action needed
-  }
-  else
-  {
-#pragma omp task shared(node)
-    assign_codes(node->left, code + "1");
-#pragma omp task shared(node)
-    assign_codes(node->right, code + "0");
-  }
+  assign_codes(node->left, code + "1");
+  assign_codes(node->right, code + "0");
 }
 
 int main(int argc, char *argv[])
@@ -94,13 +87,11 @@ int main(int argc, char *argv[])
   long int total_size = 0, size;
   total_bits += 16 + 9 * (argc - 1);
 
-  // Initialize global frequency array
-  for (long int *i = number; i < number + 256; i++)
-  {
-    *i = 0;
-  }
-
   // Parallel region for counting byte frequencies
+  long int total_number[256] = {0};
+  long int global_total_size = 0;
+  long int global_total_bits = 0;
+
 #pragma omp parallel
   {
     long int local_number[256] = {0};
@@ -141,12 +132,16 @@ int main(int argc, char *argv[])
     {
       for (int i = 0; i < 256; i++)
       {
-        number[i] += local_number[i];
+        total_number[i] += local_number[i];
       }
-      total_size += local_total_size;
-      total_bits += local_total_bits;
+      global_total_size += local_total_size;
+      global_total_bits += local_total_bits;
     }
   }
+
+  memcpy(number, total_number, sizeof(number));
+  total_size += global_total_size;
+  total_bits += global_total_bits;
 
   for (long int *i = number; i < number + 256; i++)
   {
@@ -231,20 +226,13 @@ int main(int argc, char *argv[])
     }
   }
 
-  // Parallel code assignment
+  // Code assignment
   ersel *root = current - 1;
-
-#pragma omp parallel
-  {
-#pragma omp single nowait
-    {
-      assign_codes(root, "");
-    }
-  }
+  assign_codes(root, "");
 
   compressed_fp = fopen(&scompressed[0], "wb");
   int current_bit_count = 0;
-  unsigned char current_byte;
+  unsigned char current_byte = 0;
 
   // Writing first
   fwrite(&letter_count, 1, 1, compressed_fp);
@@ -310,6 +298,7 @@ int main(int argc, char *argv[])
       if (current_bit_count == 8)
       {
         fwrite(&current_byte, 1, 1, compressed_fp);
+        current_byte = 0;
         current_bit_count = 0;
       }
       switch (*str_pointer)
@@ -332,8 +321,6 @@ int main(int argc, char *argv[])
       }
       str_pointer++;
     }
-
-    total_bits += len * (e->number);
   }
   if (total_bits % 8)
   {
@@ -367,69 +354,79 @@ int main(int argc, char *argv[])
   // Writing fourth
   write_file_count(argc - 1, current_byte, current_bit_count, compressed_fp);
 
+  // Prepare thread-local buffers
+  int num_files = argc - 1;
+  vector<vector<unsigned char>> thread_buffers(num_files);
+  vector<int> buffer_bit_counts(num_files, 0);
+
   // Parallel file compression
 #pragma omp parallel for schedule(dynamic)
   for (int current_file = 1; current_file < argc; current_file++)
   {
-
-    unsigned char local_current_byte;
-    int local_current_bit_count;
-    FILE *local_original_fp = NULL;
+    vector<unsigned char> &local_buffer = thread_buffers[current_file - 1];
+    int &local_bit_count = buffer_bit_counts[current_file - 1];
+    unsigned char local_current_byte = 0;
 
     if (this_is_not_a_folder(argv[current_file]))
     { // if current is a file and not a folder
-      local_original_fp = fopen(argv[current_file], "rb");
+      FILE *local_original_fp = fopen(argv[current_file], "rb");
       fseek(local_original_fp, 0, SEEK_END);
       long int size = ftell(local_original_fp);
       rewind(local_original_fp);
 
       // Writing fifth
-#pragma omp critical
+      local_current_byte <<= 1;
+      local_current_byte |= 1;
+      local_bit_count++;
+
+      // Write file size
+      for (int i = 0; i < 8; i++)
       {
-        if (current_bit_count == 8)
-        {
-          fwrite(&current_byte, 1, 1, compressed_fp);
-          current_bit_count = 0;
-        }
-        current_byte <<= 1;
-        current_byte |= 1;
-        current_bit_count++;
+        unsigned char temp = (size >> ((7 - i) * 8)) & 0xFF;
+        write_from_uChar(temp, local_current_byte, local_bit_count, local_buffer);
       }
 
-      write_file_size(size, current_byte, current_bit_count, compressed_fp);                                    // writes sixth
-      write_file_name(argv[current_file], str_arr, current_byte, current_bit_count, compressed_fp);             // writes seventh
-      write_the_file_content(local_original_fp, size, str_arr, current_byte, current_bit_count, compressed_fp); // writes eighth
+      // Write file name
+      write_file_name(argv[current_file], str_arr, local_current_byte, local_bit_count, local_buffer);
+
+      // Write file content
+      write_the_file_content(local_original_fp, size, str_arr, local_current_byte, local_bit_count, local_buffer);
+
       fclose(local_original_fp);
     }
     else
     { // if current is a folder
-
       // Writing fifth
-#pragma omp critical
-      {
-        if (current_bit_count == 8)
-        {
-          fwrite(&current_byte, 1, 1, compressed_fp);
-          current_bit_count = 0;
-        }
-        current_byte <<= 1;
-        current_bit_count++;
-      }
+      local_current_byte <<= 1;
+      local_bit_count++;
 
-      write_file_name(argv[current_file], str_arr, current_byte, current_bit_count, compressed_fp); // writes seventh
+      // Write folder name
+      write_file_name(argv[current_file], str_arr, local_current_byte, local_bit_count, local_buffer);
 
-      string folder_name = argv[current_file];
-      write_the_folder(folder_name, str_arr, current_byte, current_bit_count, compressed_fp);
+      // Write folder content
+      write_the_folder(argv[current_file], str_arr, local_current_byte, local_bit_count, local_buffer);
+    }
+
+    // Flush remaining bits in local buffer
+    if (local_bit_count > 0 && local_bit_count < 8)
+    {
+      local_current_byte <<= (8 - local_bit_count);
+      local_buffer.push_back(local_current_byte);
+      local_bit_count = 0;
     }
   }
 
-  if (current_bit_count == 8)
-  { // writing the last byte of the file
-    fwrite(&current_byte, 1, 1, compressed_fp);
-  }
-  else
+  // Write buffers to compressed file sequentially
+  for (int i = 0; i < num_files; i++)
   {
-    current_byte <<= 8 - current_bit_count;
+    vector<unsigned char> &local_buffer = thread_buffers[i];
+    fwrite(&local_buffer[0], 1, local_buffer.size(), compressed_fp);
+  }
+
+  // Flush remaining bits
+  if (current_bit_count > 0 && current_bit_count < 8)
+  {
+    current_byte <<= (8 - current_bit_count);
     fwrite(&current_byte, 1, 1, compressed_fp);
   }
 
@@ -442,17 +439,41 @@ int main(int argc, char *argv[])
   return 0;
 }
 
-// Function definitions remain largely the same, ensure thread safety where necessary
+// Modified functions to support thread-local buffers
 
-void write_from_uChar(unsigned char uChar, unsigned char &current_byte, int current_bit_count, FILE *fp_write)
+void write_from_uChar(unsigned char uChar, unsigned char &current_byte, int &current_bit_count, vector<unsigned char> &buffer)
 {
-  current_byte <<= 8 - current_bit_count;
-  current_byte |= (uChar >> current_bit_count);
-  fwrite(&current_byte, 1, 1, fp_write);
-  current_byte = uChar;
+  for (int i = 0; i < 8; i++)
+  {
+    if (current_bit_count == 8)
+    {
+      buffer.push_back(current_byte);
+      current_byte = 0;
+      current_bit_count = 0;
+    }
+    current_byte <<= 1;
+    current_byte |= (uChar >> (7 - i)) & 1;
+    current_bit_count++;
+  }
 }
 
-void write_file_count(int file_count, unsigned char &current_byte, int current_bit_count, FILE *compressed_fp)
+void write_from_uChar(unsigned char uChar, unsigned char &current_byte, int &current_bit_count, FILE *fp_write)
+{
+  for (int i = 0; i < 8; i++)
+  {
+    if (current_bit_count == 8)
+    {
+      fwrite(&current_byte, 1, 1, fp_write);
+      current_byte = 0;
+      current_bit_count = 0;
+    }
+    current_byte <<= 1;
+    current_byte |= (uChar >> (7 - i)) & 1;
+    current_bit_count++;
+  }
+}
+
+void write_file_count(int file_count, unsigned char &current_byte, int &current_bit_count, FILE *compressed_fp)
 {
   unsigned char temp = file_count % 256;
   write_from_uChar(temp, current_byte, current_bit_count, compressed_fp);
@@ -460,19 +481,18 @@ void write_file_count(int file_count, unsigned char &current_byte, int current_b
   write_from_uChar(temp, current_byte, current_bit_count, compressed_fp);
 }
 
-void write_file_size(long int size, unsigned char &current_byte, int current_bit_count, FILE *compressed_fp)
+void write_file_size(long int size, unsigned char &current_byte, int &current_bit_count, vector<unsigned char> &buffer)
 {
-  PROGRESS.next(size); // updating progress bar
   for (int i = 0; i < 8; i++)
   {
-    write_from_uChar(size % 256, current_byte, current_bit_count, compressed_fp);
-    size /= 256;
+    unsigned char temp = (size >> ((7 - i) * 8)) & 0xFF;
+    write_from_uChar(temp, current_byte, current_bit_count, buffer);
   }
 }
 
-void write_file_name(char *file_name, string *str_arr, unsigned char &current_byte, int &current_bit_count, FILE *compressed_fp)
+void write_file_name(char *file_name, string *str_arr, unsigned char &current_byte, int &current_bit_count, vector<unsigned char> &buffer)
 {
-  write_from_uChar(strlen(file_name), current_byte, current_bit_count, compressed_fp);
+  write_from_uChar(strlen(file_name), current_byte, current_bit_count, buffer);
   char *str_pointer;
   for (char *c = file_name; *c; c++)
   {
@@ -481,7 +501,8 @@ void write_file_name(char *file_name, string *str_arr, unsigned char &current_by
     {
       if (current_bit_count == 8)
       {
-        fwrite(&current_byte, 1, 1, compressed_fp);
+        buffer.push_back(current_byte);
+        current_byte = 0;
         current_bit_count = 0;
       }
       switch (*str_pointer)
@@ -505,7 +526,7 @@ void write_file_name(char *file_name, string *str_arr, unsigned char &current_by
   }
 }
 
-void write_the_file_content(FILE *original_fp, long int size, string *str_arr, unsigned char &current_byte, int &current_bit_count, FILE *compressed_fp)
+void write_the_file_content(FILE *original_fp, long int size, string *str_arr, unsigned char &current_byte, int &current_bit_count, vector<unsigned char> &buffer)
 {
   unsigned char x;
   char *str_pointer;
@@ -517,7 +538,8 @@ void write_the_file_content(FILE *original_fp, long int size, string *str_arr, u
     {
       if (current_bit_count == 8)
       {
-        fwrite(&current_byte, 1, 1, compressed_fp);
+        buffer.push_back(current_byte);
+        current_byte = 0;
         current_bit_count = 0;
       }
       switch (*str_pointer)
@@ -539,6 +561,75 @@ void write_the_file_content(FILE *original_fp, long int size, string *str_arr, u
       str_pointer++;
     }
   }
+}
+
+void write_the_folder(string path, string *str_arr, unsigned char &current_byte, int &current_bit_count, vector<unsigned char> &buffer)
+{
+  FILE *original_fp;
+  path += '/';
+  DIR *dir = opendir(&path[0]), *next_dir;
+  string next_path;
+  struct dirent *current;
+  int file_count = 0;
+  long int size;
+  while ((current = readdir(dir)))
+  {
+    if (current->d_name[0] == '.')
+    {
+      if (current->d_name[1] == 0)
+        continue;
+      if (current->d_name[1] == '.' && current->d_name[2] == 0)
+        continue;
+    }
+    file_count++;
+  }
+  rewinddir(dir);
+  // Writes fourth
+  unsigned char temp = file_count % 256;
+  write_from_uChar(temp, current_byte, current_bit_count, buffer);
+  temp = file_count / 256;
+  write_from_uChar(temp, current_byte, current_bit_count, buffer);
+
+  while ((current = readdir(dir)))
+  { // if current is a file
+    if (current->d_name[0] == '.')
+    {
+      if (current->d_name[1] == 0)
+        continue;
+      if (current->d_name[1] == '.' && current->d_name[2] == 0)
+        continue;
+    }
+
+    next_path = path + current->d_name;
+    if (this_is_not_a_folder(&next_path[0]))
+    {
+      original_fp = fopen(&next_path[0], "rb");
+      fseek(original_fp, 0, SEEK_END);
+      size = ftell(original_fp);
+      rewind(original_fp);
+
+      // Writing fifth
+      current_byte <<= 1;
+      current_byte |= 1;
+      current_bit_count++;
+
+      write_file_size(size, current_byte, current_bit_count, buffer);                              // writes sixth
+      write_file_name(current->d_name, str_arr, current_byte, current_bit_count, buffer);          // writes seventh
+      write_the_file_content(original_fp, size, str_arr, current_byte, current_bit_count, buffer); // writes eighth
+      fclose(original_fp);
+    }
+    else
+    { // if current is a folder
+      // Writing fifth
+      current_byte <<= 1;
+      current_bit_count++;
+
+      write_file_name(current->d_name, str_arr, current_byte, current_bit_count, buffer); // writes seventh
+
+      write_the_folder(next_path, str_arr, current_byte, current_bit_count, buffer);
+    }
+  }
+  closedir(dir);
 }
 
 int this_is_not_a_folder(char *path)
@@ -609,83 +700,6 @@ void count_in_folder(string path, long int *local_number, long int &local_total_
         local_number[x]++;
       }
       fclose(original_fp);
-    }
-  }
-  closedir(dir);
-}
-
-void write_the_folder(string path, string *str_arr, unsigned char &current_byte, int &current_bit_count, FILE *compressed_fp)
-{
-  FILE *original_fp;
-  path += '/';
-  DIR *dir = opendir(&path[0]), *next_dir;
-  string next_path;
-  struct dirent *current;
-  int file_count = 0;
-  long int size;
-  while ((current = readdir(dir)))
-  {
-    if (current->d_name[0] == '.')
-    {
-      if (current->d_name[1] == 0)
-        continue;
-      if (current->d_name[1] == '.' && current->d_name[2] == 0)
-        continue;
-    }
-    file_count++;
-  }
-  rewinddir(dir);
-  write_file_count(file_count, current_byte, current_bit_count, compressed_fp); // writes fourth
-
-  while ((current = readdir(dir)))
-  { // if current is a file
-    if (current->d_name[0] == '.')
-    {
-      if (current->d_name[1] == 0)
-        continue;
-      if (current->d_name[1] == '.' && current->d_name[2] == 0)
-        continue;
-    }
-
-    next_path = path + current->d_name;
-    if (this_is_not_a_folder(&next_path[0]))
-    {
-
-      original_fp = fopen(&next_path[0], "rb");
-      fseek(original_fp, 0, SEEK_END);
-      size = ftell(original_fp);
-      rewind(original_fp);
-
-      // Writing fifth
-      if (current_bit_count == 8)
-      {
-        fwrite(&current_byte, 1, 1, compressed_fp);
-        current_bit_count = 0;
-      }
-      current_byte <<= 1;
-      current_byte |= 1;
-      current_bit_count++;
-
-      write_file_size(size, current_byte, current_bit_count, compressed_fp);                              // writes sixth
-      write_file_name(current->d_name, str_arr, current_byte, current_bit_count, compressed_fp);          // writes seventh
-      write_the_file_content(original_fp, size, str_arr, current_byte, current_bit_count, compressed_fp); // writes eighth
-      fclose(original_fp);
-    }
-    else
-    { // if current is a folder
-
-      // Writing fifth
-      if (current_bit_count == 8)
-      {
-        fwrite(&current_byte, 1, 1, compressed_fp);
-        current_bit_count = 0;
-      }
-      current_byte <<= 1;
-      current_bit_count++;
-
-      write_file_name(current->d_name, str_arr, current_byte, current_bit_count, compressed_fp); // writes seventh
-
-      write_the_folder(next_path, str_arr, current_byte, current_bit_count, compressed_fp);
     }
   }
   closedir(dir);
